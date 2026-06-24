@@ -15,8 +15,26 @@ Implementado:
 - [`vcot.telemetry.cost_timer`](src/vcot/telemetry/cost_timer.py) — cronómetro que
   mide `compute_s` real y lo convierte a USD (IDEA.md §7.3).
 - [`vcot.cli`](src/vcot/cli.py) — estimador de coste por línea de comandos.
+- [`modal_app/renderer.py`](modal_app/renderer.py) — **N7 (Final Render)**: genera
+  imágenes con FLUX.2 sobre Modal, instrumentado con `cost_timer`. Por defecto usa
+  **FLUX.2-klein-9B** (el modelo "Klein" de IDEA.md). Setup y uso en
+  [modal_app/README.md](modal_app/README.md).
 
-Pendiente (ver [IDEA.md §10](IDEA.md)): `modal_app/`, `dataset/`, `analysis/`, `train/`.
+Pendiente (ver [IDEA.md §10](IDEA.md)): planner N1–N6, `dataset/`, `analysis/`, `train/`.
+
+## Generar imágenes (renderer N7)
+
+Requiere cuenta de Modal y aceptar la licencia gated de FLUX.2 — pasos completos en
+[modal_app/README.md](modal_app/README.md). Resumen:
+
+```powershell
+pip install -e ".[modal]"
+modal setup
+modal secret create huggingface-secret HF_TOKEN=hf_xxx
+modal run modal_app/renderer.py --prompt "a lone astronaut in a gothic cathedral, moonlight"
+```
+
+La imagen se descarga a `outputs/` y se imprime la telemetría real de coste.
 
 ## Instalación (Windows PowerShell)
 

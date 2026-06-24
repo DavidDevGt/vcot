@@ -22,6 +22,8 @@ ml = [
     "tokenizers",
     "huggingface-hub",
 ]
+# Cliente de Modal para lanzar el renderer N7 (modal_app/).
+modal = ["modal"]
 dev = ["pytest"]
 
 [project.scripts]
