@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vcot"
+version = "0.1.0"
+description = "Visual Chain of Thought — instrumentación de coste e inferencia sobre Modal.com"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "vcot" }]
+dependencies = []
+
+[project.optional-dependencies]
+# Stack de modelos/pipeline (IDEA.md). No lo necesita el núcleo de telemetría.
+ml = [
+    "torch",
+    "transformers",
+    "datasets",
+    "accelerate",
+    "tokenizers",
+    "huggingface-hub",
+]
+dev = ["pytest"]
+
+[project.scripts]
+vcot = "vcot.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"

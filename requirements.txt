@@ -1,0 +1,6 @@
+# Las dependencias se gestionan en pyproject.toml (extras: dev, ml).
+# Este archivo es un atajo para entornos de desarrollo.
+#
+#   pip install -r requirements.txt        -> núcleo + pytest
+#   pip install -e ".[dev,ml]"             -> añade torch/transformers/datasets/...
+-e .[dev]
