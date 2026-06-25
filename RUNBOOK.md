@@ -122,13 +122,13 @@ python -m vcot.pipeline.run --prompt "..."
 
 ## Tiempos y costes reales (medidos en Modal, 2026-06-25)
 
-| Paso | GPU | compute | $/muestra | carga (1ª vez) |
+| Paso | GPU | compute (media) | $/muestra | carga (1ª vez) |
 |---|---|--:|--:|--:|
-| Razonamiento N1–N6 (Qwen3-8B) | A100-40GB | 12.6–18.9 s | $0.0074–0.011 | 39–76 s |
-| Render N7 (FLUX.2-klein) | A100-80GB | 3.19 s | $0.00221 | ~149 s (descarga ~29 GB) |
-| **E2E N1→N7** | — | — | **≈ $0.0096** | — |
+| Razonamiento N1–N6 (Qwen3-8B) | A100-40GB | 24.1 s | $0.0141 (rango 0.0074–0.0268) | 39–76 s |
+| Render N7 (FLUX.2-klein, 4 variaciones) | A100-80GB | 9.6 s | $0.0067 ($0.0017/img) | ~149 s (descarga ~29 GB) |
+| **E2E (razonamiento + 4 imgs)** | — | — | **≈ $0.021** | — |
 
-El razonamiento cuesta ~3× el render; la etapa N2 (layout) es la más cara. Detalle en [IDEA.md §8.3](IDEA.md).
+El razonamiento cuesta ~2× el render (4 imgs) y la etapa N2 (layout) es ~50% del coste. Detalle (dataset de 15 trazas) en [IDEA.md §8.3](IDEA.md).
 
 ## Gotchas
 
