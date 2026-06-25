@@ -37,6 +37,25 @@ Predicate = Literal[
     "casts_shadow_on", "illuminated_by", "passes_through", "reflects", "part_of",
 ]
 
+#: Sinónimos comunes que los modelos pueden emitir y que deben normalizarse a
+#: vocabulario canónico para que la etapa pueda validar con robustez.
+PREDICATE_SYNONYMS: dict[str, str] = {
+    "in": "inside",
+    "appear_on": "on",
+    "appear_above": "above",
+    "appear_below": "below",
+    "appear_behind": "behind",
+    "appear_in_front_of": "in_front_of",
+    "appear_in_front": "in_front_of",
+    "in_front": "in_front_of",
+    "in_frontof": "in_front_of",
+    "on_top_of": "on",
+    "onto": "on",
+    "inside_of": "inside",
+    "partof": "part_of",
+    "part_of": "part_of",
+}
+
 #: Superficies/anclas implícitas válidas como extremo de una relación aunque no
 #: se declaren como entidad (p.ej. una sombra cae sobre el `floor`). Evita que el
 #: modelo tenga que inventar entidades — y que el validador degrade la relación.
@@ -110,6 +129,15 @@ class Relation(BaseModel):
     """Arista del scene graph: ``subject —predicate→ object`` (ids de entidad)."""
 
     subject: str = Field(..., min_length=1)
+
+    @field_validator("predicate", mode="before")
+    @classmethod
+    def _normalize_predicate(cls, v):
+        if isinstance(v, str):
+            norm = v.strip().lower()
+            return PREDICATE_SYNONYMS.get(norm, norm)
+        return v
+
     predicate: Predicate
     object: str = Field(..., min_length=1)
 

@@ -73,6 +73,14 @@ def test_layout_relation_allows_implicit_anchor():
     assert layout.relations[0].object == "floor"
 
 
+def test_relation_predicate_normalizes_synonyms():
+    relation = Relation(subject="a", predicate="in", object="b")
+    assert relation.predicate == "inside"
+
+    relation = Relation(subject="a", predicate="appear_on", object="b")
+    assert relation.predicate == "on"
+
+
 def test_composition_subject_scale_bounds():
     with pytest.raises(ValidationError):
         Composition(

@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 import time
 import uuid
 
@@ -278,6 +279,8 @@ def generate(prompts_file: str = "", limit: int = 0, out: str = "outputs"):
 
     n = 0
     total_cost = 0.0
+    from modal._utils.async_utils import ExceptionWrapper
+
     with track_run(
         os.path.join(out, "runs.jsonl"),
         kind="dataset",
@@ -286,7 +289,18 @@ def generate(prompts_file: str = "", limit: int = 0, out: str = "outputs"):
         params={"n_prompts": len(prompts)},
     ) as run:
         with open(traces_path, "a", encoding="utf-8") as fh:
-            for rec in Planner().plan.map(prompts):
+            for index, item in enumerate(
+                Planner().plan.map(prompts, return_exceptions=True), start=1
+            ):
+                if isinstance(item, ExceptionWrapper):
+                    prompt = prompts[index - 1] if index <= len(prompts) else "<unknown>"
+                    print(
+                        f"WARNING: prompt #{index} failed while planning: {prompt!r}\n"
+                        f"  error: {item.value}",
+                        file=sys.stderr,
+                    )
+                    continue
+                rec = item
                 fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
                 n += 1
                 total_cost += sum(t["projected_cost_usd"] for t in rec["telemetry"].values())
