@@ -6,6 +6,9 @@ nunca se almacenan por separado para evitar que diverjan.
 
 Si Modal actualiza precios, este archivo es el único punto a tocar: todos los
 informes de coste del proyecto importan desde aquí.
+
+Verificado contra https://modal.com/pricing el 2026-06-24 (sin cambios respecto a
+los valores ya tabulados).
 """
 
 from __future__ import annotations

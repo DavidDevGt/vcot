@@ -10,7 +10,10 @@ readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }
 authors = [{ name = "vcot" }]
-dependencies = []
+# pydantic: esquemas validados de las etapas de razonamiento (N1–N6). El planner
+# habla con un LLM **local** vía endpoint OpenAI-compatible usando solo la stdlib,
+# así que no añade más dependencias de runtime.
+dependencies = ["pydantic>=2"]
 
 [project.optional-dependencies]
 # Stack de modelos/pipeline (IDEA.md). No lo necesita el núcleo de telemetría.
@@ -22,8 +25,10 @@ ml = [
     "tokenizers",
     "huggingface-hub",
 ]
-# Cliente de Modal para lanzar el renderer N7 (modal_app/).
+# Cliente de Modal para lanzar planner (N1–N6) y renderer (N7) en modal_app/.
 modal = ["modal"]
+# Destilación de Klein (vcot.train) — entrenamiento SFT, IDEA.md §5/M5.
+train = ["trl", "transformers", "datasets", "accelerate", "peft"]
 dev = ["pytest"]
 
 [project.scripts]

@@ -61,6 +61,13 @@ GPU = os.environ.get("VCOT_GPU", CFG["gpu"])  # debe coincidir con una clave de 
 CACHE_DIR = "/cache"
 OUTPUT_DIR = "/outputs"
 
+#: Negativo sugerido (artefactos comunes). Vacío por defecto: el negativo es
+#: opt-in porque en FLUX requiere CFG real (~2× coste). Pasalo con --negative.
+DEFAULT_NEGATIVE = (
+    "blurry, low quality, distorted, deformed, extra limbs, bad anatomy, "
+    "watermark, text, signature, jpeg artifacts, oversaturated"
+)
+
 # --------------------------------------------------------------------------- #
 # Imagen del contenedor (patrón del ejemplo oficial image_to_image de Modal)
 # --------------------------------------------------------------------------- #
@@ -73,9 +80,10 @@ image = (
         "Pillow~=11.2.1",
         "accelerate~=1.8.1",
         # FLUX.2 (Flux2Pipeline / Flux2KleinPipeline) requiere diffusers reciente.
+        # No pinear safetensors/huggingface-hub: diffusers-git exige safetensors
+        # >=0.8.0 y mueve rápido; dejamos que el resolver elija versiones compatibles.
         "git+https://github.com/huggingface/diffusers.git",
-        "huggingface-hub==0.36.0",
-        "safetensors==0.5.3",
+        "huggingface-hub",
         "sentencepiece==0.2.0",
         # transformers reciente para el text-encoder Qwen3 de FLUX.2.
         "transformers>=4.57.0",
@@ -132,38 +140,76 @@ class Renderer:
     def render(
         self,
         prompt: str,
+        negative_prompt: str = "",
         steps: int | None = None,
         guidance: float | None = None,
         seed: int | None = None,
         height: int = 1024,
         width: int = 1024,
+        n_variations: int = 4,
+        true_cfg_scale: float = 1.0,
     ) -> dict:
-        """Genera una imagen y devuelve telemetría + bytes WebP (IDEA.md §4.2, §6)."""
+        """Genera **N variaciones** del mismo prompt; telemetría + bytes WebP (§4.2, §6).
+
+        Las variaciones se generan en un solo batch (`num_images_per_prompt`):
+        comparten el text-encoding y el contenedor cálido, así que salen mucho más
+        baratas que N llamadas separadas.
+
+        **Prompt negativo:** FLUX es *guidance-distilled*, así que `negative_prompt`
+        solo surte efecto con CFG real (`true_cfg_scale > 1`), que ~duplica el
+        cómputo. Si das un negativo sin CFG, se sube `true_cfg_scale` a 4.0. Se pasa
+        solo si el pipeline lo soporta (FLUX.2 varía según versión de diffusers).
+        """
+        import inspect
         import torch
         from vcot.telemetry import cost_timer  # noqa: WPS433 (import diferido al contenedor)
 
         steps = steps or CFG["steps"]
         guidance = CFG["guidance"] if guidance is None else guidance
+        n_variations = max(1, n_variations)
+        negative_prompt = (negative_prompt or "").strip()
+        if negative_prompt and true_cfg_scale <= 1.0:
+            true_cfg_scale = 4.0  # sin CFG real el negativo se ignora
         generator = (
             torch.Generator(device="cuda").manual_seed(seed) if seed is not None else None
         )
 
-        with cost_timer(gpu=GPU) as t:
-            result = self.pipe(
-                prompt=prompt,
-                num_inference_steps=steps,
-                guidance_scale=guidance,
-                height=height,
-                width=width,
-                generator=generator,
-            )
-        pil_image = result.images[0]
+        call_kwargs = dict(
+            prompt=prompt,
+            num_images_per_prompt=n_variations,
+            num_inference_steps=steps,
+            guidance_scale=guidance,
+            height=height,
+            width=width,
+            generator=generator,
+        )
+        # Solo pasamos negativo/CFG si el pipeline los acepta (evita TypeError).
+        supported = inspect.signature(self.pipe.__call__).parameters
+        applied_negative = False
+        if negative_prompt and "negative_prompt" in supported:
+            call_kwargs["negative_prompt"] = negative_prompt
+            if "true_cfg_scale" in supported:
+                call_kwargs["true_cfg_scale"] = true_cfg_scale
+            applied_negative = True
+        elif negative_prompt:
+            print(f"[warn] {CFG['pipeline']} no soporta negative_prompt — se ignora")
 
-        buf = io.BytesIO()
-        pil_image.save(buf, format="WEBP", quality=92)
-        image_bytes = buf.getvalue()
+        with cost_timer(gpu=GPU) as t:
+            result = self.pipe(**call_kwargs)
+
+        image_bytes_list = []
+        for img in result.images:
+            buf = io.BytesIO()
+            img.save(buf, format="WEBP", quality=92)
+            image_bytes_list.append(buf.getvalue())
+        n = len(image_bytes_list)
 
         sample_id = uuid.uuid4().hex
+        final_images = [f"{OUTPUT_DIR}/{sample_id}_{i}.webp" for i in range(n)]
+        render_tel = t.as_dict()  # {compute_s, rate_usd_per_s, cost_usd}
+        render_tel["n_variations"] = n
+        render_tel["cost_per_image_usd"] = round(t.cost / n, 8) if n else 0.0
+
         record = {
             "id": sample_id,
             "prompt": prompt,
@@ -176,26 +222,31 @@ class Renderer:
                 "guidance": guidance,
                 "seed": seed,
                 "resolution": [width, height],
+                "n_variations": n,
+                "negative_prompt": negative_prompt if applied_negative else "",
+                "true_cfg_scale": true_cfg_scale if applied_negative else 1.0,
             },
             "telemetry": {
-                "render": t.as_dict(),  # {compute_s, rate_usd_per_s, cost_usd}
+                "render": render_tel,
                 "model_load_s": round(self.model_load_s, 3),
             },
-            "final_image": f"{OUTPUT_DIR}/{sample_id}.webp",
+            "final_image": final_images[0],  # variación principal
+            "final_images": final_images,
         }
 
-        # Persistir imagen + registro JSONL en el Volume (dataset incremental).
-        with open(f"{OUTPUT_DIR}/{sample_id}.webp", "wb") as fh:
-            fh.write(image_bytes)
+        # Persistir las N variaciones + registro JSONL en el Volume.
+        for path, image_bytes in zip(final_images, image_bytes_list):
+            with open(path, "wb") as fh:
+                fh.write(image_bytes)
         with open(f"{OUTPUT_DIR}/records.jsonl", "a") as fh:
             fh.write(json.dumps(record) + "\n")
         outputs.commit()
 
         print(
-            f"[render] {sample_id} · {t.seconds:.2f}s · ${t.cost:.5f} "
-            f"({steps} pasos, {GPU})"
+            f"[render] {sample_id} · {n} variaciones · {t.seconds:.2f}s · ${t.cost:.5f} "
+            f"(${render_tel['cost_per_image_usd']:.5f}/img, {steps} pasos, {GPU})"
         )
-        record["_image_bytes"] = image_bytes  # se quita antes de imprimir en local
+        record["_image_bytes_list"] = image_bytes_list  # se quita antes de imprimir
         return record
 
 
@@ -210,23 +261,46 @@ def main(
         "a lone astronaut inside an abandoned gothic cathedral, "
         "moonlight through stained glass, volumetric fog, cinematic"
     ),
+    negative: str = "",
     steps: int = 0,
     seed: int = -1,
+    variations: int = 4,
+    cfg: float = 0.0,
     out: str = "outputs",
 ):
-    """Genera una imagen y la guarda en local junto a su telemetría."""
-    record = Renderer().render.remote(
-        prompt,
-        steps=steps or None,
-        seed=None if seed < 0 else seed,
-    )
-    image_bytes = record.pop("_image_bytes")
+    """Genera N variaciones (4 por defecto) del prompt y las guarda en local.
+
+    `--negative` activa prompt negativo (CFG real, ~2× coste; usá `--negative
+    default` para el negativo sugerido). `--cfg` fija true_cfg_scale (0 = auto).
+    """
+    from vcot.reporting.runlog import track_run
+
+    if negative.strip().lower() == "default":
+        negative = DEFAULT_NEGATIVE
 
     os.makedirs(out, exist_ok=True)
-    img_path = os.path.join(out, f"{record['id']}.webp")
-    with open(img_path, "wb") as fh:
-        fh.write(image_bytes)
+    with track_run(os.path.join(out, "runs.jsonl"), kind="renderer", model=CFG["repo"], gpu=GPU) as run:
+        record = Renderer().render.remote(
+            prompt,
+            negative_prompt=negative,
+            steps=steps or None,
+            seed=None if seed < 0 else seed,
+            n_variations=variations,
+            true_cfg_scale=cfg if cfg > 0 else 1.0,
+        )
+        run["n_items"] = record["meta"]["n_variations"]
+        run["total_cost_usd"] = record["telemetry"]["render"]["cost_usd"]
+    image_bytes_list = record.pop("_image_bytes_list")
 
-    print(f"\nImagen  -> {img_path}")
+    paths = []
+    for i, image_bytes in enumerate(image_bytes_list):
+        p = os.path.join(out, f"{record['id']}_{i}.webp")
+        with open(p, "wb") as fh:
+            fh.write(image_bytes)
+        paths.append(p)
+
+    print(f"\n{len(paths)} variaciones ->")
+    for p in paths:
+        print("  " + p)
     print("Telemetría:")
     print(json.dumps(record["telemetry"], indent=2, ensure_ascii=False))

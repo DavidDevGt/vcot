@@ -18,8 +18,8 @@
   Chain-of-Thought textual. Cada paso intermedio es **observable**, **serializable**
   y **criticable**.
 - **Plan experimental:**
-  1. Usar un modelo grande (FLUX.1-dev como renderer + un LLM/VLM como *planner*)
-     para generar un **dataset sintético de razonamiento visual** a gran escala.
+  1. Usar Qwen3-8B como *planner* + FLUX.2 como renderer para generar un
+     **dataset sintético de razonamiento visual** a gran escala.
   2. **Destilar** ese proceso en un modelo pequeño ("Klein", 4B–9B) que aprende a
      *pensar* visualmente, no solo a renderizar.
   3. **Medirlo todo**: latencia por etapa, throughput, memoria GPU, tokens/s,
@@ -27,6 +27,11 @@
 - **Infra:** Modal.com (serverless GPU). Cada etapa del pipeline es una `Function`
   independiente, lo que permite atribuir coste **por etapa** y elegir el GPU
   óptimo para cada una.
+- **Medido (Modal, 2026-06-25 · 15 trazas):** razonamiento N1–N6 media
+  **$0.0141/traza** + **4 imágenes** $0.0067 ≈ **$0.021/muestra**. El razonamiento
+  cuesta ~2× el render y **N2 (layout) es ~50%** del coste — el coste vive en la
+  cadena de decisiones (§8.3). El salto v1→v2 disparó la **diversidad**
+  (`subject_scale` 1→3 valores; español 2/9→0/6; relaciones 0→4.2/traza) — §8.6.
 - **Entregable central:** no "mejores imágenes", sino un **Visual Reasoning Model**
   y un **modelo de costes de inferencia** reproducible.
 
@@ -117,19 +122,30 @@ intermedios de baja resolución para N2–N6). Esto hace toda la cadena auditabl
 }
 ```
 
-**N2 — Spatial Layout** (scene graph + geometría aproximada):
+**N2 — Spatial Layout** (scene graph: entidades **tipadas** + **relaciones**):
 
 ```json
 {
   "canvas": [1024, 1024],
   "entities": [
-    {"id": "astronaut",  "bbox": [0.35, 0.45, 0.65, 0.95], "z": 1},
-    {"id": "moonlight",  "bbox": [0.00, 0.00, 0.40, 0.30], "z": 3},
-    {"id": "cathedral",  "bbox": [0.00, 0.00, 1.00, 1.00], "z": 4},
-    {"id": "fog",        "bbox": [0.00, 0.70, 1.00, 1.00], "z": 0}
+    {"id": "astronaut", "kind": "character",  "bbox": [0.35, 0.45, 0.65, 0.95], "z": 1},
+    {"id": "cathedral", "kind": "background", "bbox": [0.00, 0.00, 1.00, 1.00], "z": 4},
+    {"id": "moonlight", "kind": "light",      "bbox": [0.10, 0.00, 0.45, 0.40], "z": 3},
+    {"id": "fog",       "kind": "atmosphere", "bbox": [0.00, 0.70, 1.00, 1.00], "z": 0}
+  ],
+  "relations": [
+    {"subject": "astronaut", "predicate": "inside",         "object": "cathedral"},
+    {"subject": "moonlight", "predicate": "passes_through", "object": "cathedral"},
+    {"subject": "astronaut", "predicate": "illuminated_by", "object": "moonlight"}
   ]
 }
 ```
+
+> `kind` separa **objeto/personaje** (con bbox real) de **luz/atmósfera/sombra**
+> (un efecto no es un objeto de pantalla completa); solo `background` puede ocupar
+> todo el lienzo. Las `relations` son el scene graph — el *cómo se relacionan* las
+> cosas, no solo dónde están. Esto ataca el *schema filling* (decisiones genéricas)
+> empujando hacia *reasoned decomposition*.
 
 **N3 — Composition**:
 
@@ -166,8 +182,10 @@ Para entrenamiento eficiente, la traza se puede comprimir a una secuencia de
 tokens discretos de razonamiento visual:
 
 ```text
-PLAN_SUBJ:astronaut  ENV:cathedral  LAYOUT_C:center  LENS_35MM
-LIGHT_KEY:moon  CONTRAST_HIGH  COLOR_COLD  SAT_MED  RENDER
+PLAN_SUBJ:a-lone-astronaut  ENV:a-gothic-cathedral  CAM:low-angle-wide-shot
+AT:astronaut:character:center  AT:moonlight:light:top  REL:astronaut:inside:cathedral
+REL:moonlight:passes_through:cathedral  LENS_35MM  THIRDS  SCALE:0.6
+LIGHT_KEY:moonlight-...  CONTRAST_HIGH  COLOR_COLD  SAT_LOW  PAL:#2e2e2e  RENDER
 ```
 
 Esto convierte la imagen en una **secuencia de razonamiento** y habilita
@@ -197,48 +215,66 @@ decoración). Tres mecanismos, de menos a más fuerte:
 
 ## 4. Generación del dataset sintético
 
-### 4.1 Roles
+### 4.1 Roles (implementado)
 
-- **Planner (N1–N6):** un LLM/VLM produce la traza estructurada. Dos opciones a
-  comparar:
-  - **(A) API externa** (p.ej. Claude) — alta calidad, coste por token externo,
-    no consume GPU de Modal.
-  - **(B) LLM self-hosted en Modal** (p.ej. un 7B–14B en vLLM) — coste en GPU de
-    Modal, control total, reproducible offline.
-- **Renderer (N7):** FLUX.1-dev en GPU de Modal.
-- **Critic (opcional, ver §7):** VLM que evalúa cada etapa y permite
-  auto-corrección.
+- **Planner (N1–N6):** **Qwen3-8B** open-weights, self-hosted con vLLM en GPU de
+  Modal (A100-40GB), con *thinking mode* desactivado (en V-CoT las etapas N1–N6 ya
+  son el razonamiento explícito). Coste real medido por etapa (§8.3). La lógica es
+  agnóstica del backend (cualquier endpoint OpenAI-compatible), así que también
+  corre contra un LLM local (Ollama/LM Studio) para iterar offline sin gastar.
+- **Renderer (N7):** **FLUX.2-klein-9B** (4 pasos) en GPU de Modal (A100-80GB).
+  Genera **4 variaciones** del mismo prompt por defecto (un solo batch
+  `num_images_per_prompt` → comparten text-encoding, mucho más barato que 4
+  llamadas), guardadas en `final_images`. **Prompt negativo** opcional (`--negative`):
+  FLUX es *guidance-distilled* → solo aplica con CFG real (~2× coste); verificado que
+  `klein` no lo soporta (se ignora con warning), usar `dev` para que tenga efecto.
+- **Critic (opcional, §5.3):** VLM que evalúa cada etapa y permite auto-corrección
+  (pendiente).
 
 ### 4.2 Registro por muestra
 
-Cada muestra del dataset se persiste como un único registro:
+Cada muestra se persiste como un único registro `VCoTTrace` (lo que escribe el
+planner; valores reales de una corrida):
 
 ```json
 {
-  "id": "uuid",
-  "prompt": "...",
-  "semantic_plan": { ... },
-  "layout": { ... },
-  "composition": { ... },
-  "lighting": { ... },
-  "materials": { ... },
-  "color_script": { ... },
-  "visual_tokens": ["...", "..."],
-  "final_image": "vol://images/uuid.webp",
-  "intermediate_renders": ["vol://inter/uuid_n2.webp", "..."],
-  "meta": {
-    "planner": "claude|vllm-qwen2.5-14b",
-    "renderer": "flux.1-dev",
-    "render_steps": 28,
-    "resolution": [1024, 1024],
-    "seed": 12345
+  "id": "87de8fda...",
+  "prompt": "a lone astronaut in a gothic cathedral, moonlight",
+  "semantic_plan": { "subject": "...", "environment": "...", "...": "..." },
+  "layout": { "canvas": [1024, 1024], "entities": [ "..." ] },
+  "composition": { "...": "..." }, "lighting": { "...": "..." },
+  "materials": { "...": "..." }, "color_script": { "...": "..." },
+  "visual_tokens": ["PLAN_SUBJ:a-lone-astronaut", "...", "RENDER"],
+  "enriched_prompt": null,     // null en traza solo-planner; lo rellena el pipeline (§3.1)
+  "final_image": null,         // variación principal tras N7 (vía pipeline.py)
+  "final_images": [],          // las 4 variaciones (rutas en el Volume)
+  "render": null,              // telemetría de N7 si hubo render
+  "telemetry": {
+    "layout": {
+      "compute_s": 6.59, "rate_usd_per_s": 0.000583,
+      "projected_cost_usd": 0.003843, "projected_gpu": "A100-40GB",
+      "input_tokens": 412, "output_tokens": 254,
+      "tokens_per_s": 38.5, "retries": 0
+    }
+    // ... una entrada por etapa N1–N6
   },
-  "telemetry": { /* ver §6: latencias y coste por etapa */ }
+  "meta": {
+    "planner": "Qwen/Qwen3-8B", "projected_gpu": "A100-40GB",
+    "created_at": "2026-06-25T01:54:02+00:00",
+    "model_load_s": 49.6, "execution": "modal"
+  }
 }
 ```
 
-> El valor del dataset no son las imágenes — es la **estructura de decisiones**.
-> `ImageNet = imágenes`. `V-CoT Dataset = decisiones visuales.`
+> Los campos de N7 (`enriched_prompt`, `final_image`, `final_images`, `render`) van
+> `null` en una traza **solo-planner** (N1–N6, p.ej. `planner.py::generate`); se
+> rellenan al correr el pipeline completo N1→N7 (`pipeline.py`). El esquema es
+> uniforme, por eso aparecen como `null` en vez de faltar.
+>
+> En Modal `projected_cost_usd` es el **coste real** (`compute_s × tarifa de la GPU
+> usada`); se llama "projected" porque el mismo código corre en local para iterar,
+> donde sí es una proyección. El valor del dataset no son las imágenes — es la
+> **estructura de decisiones**. `ImageNet = imágenes`. `V-CoT = decisiones visuales.`
 
 ### 4.3 Escalas objetivo
 
@@ -248,6 +284,42 @@ Cada muestra del dataset se persiste como un único registro:
 | Pilot | 10 000 | Curvas coste/calidad, elegir GPU por etapa |
 | Alpha | 250 000 | Suficiente para destilación inicial de Klein |
 | Beta | 1 000 000+ | Dataset de referencia |
+
+### 4.4 Cómo se genera y dónde se guarda (real)
+
+**Generar el dataset** (fan-out paralelo con `.map`, §7.2):
+
+```powershell
+# lote pequeño primero (mirá el coste), luego los 36 prompts semilla
+modal run modal_app/planner.py::generate --limit 5
+modal run modal_app/planner.py::generate
+# tus propios prompts (uno por línea):
+modal run modal_app/planner.py::generate --prompts-file mis_prompts.txt
+```
+
+**Dónde queda todo:**
+
+| Artefacto | Ubicación | Qué es |
+|---|---|---|
+| Dataset (trazas) | Volume `vcot-outputs` → `traces.jsonl` + `<id>.trace.json` | persistente en Modal, incremental |
+| Copia local | `outputs/traces.jsonl` | el `generate` lo acumula también en tu disco |
+| Ledger de corridas | `outputs/runs.jsonl` | cada proceso: modelo, GPU, ítems, coste, duración, estado |
+| Imágenes (N7) | Volume `vcot-outputs` → `<id>.webp` | del renderer / pipeline |
+| Informe final | `reports/<timestamp>/` (+ `reports/latest.md`) | Markdown + JSON + CSV con fecha |
+
+**Traza completa con imagen (N1→N7)** — usar el pipeline (necesita deploy previo):
+
+```powershell
+modal deploy modal_app/planner.py ; modal deploy modal_app/renderer.py
+modal run modal_app/pipeline.py --prompt "..."     # traza con final_image + coste e2e
+```
+
+**Bajar el dataset del Volume y sacar el informe:**
+
+```powershell
+modal volume get vcot-outputs traces.jsonl outputs/traces.jsonl
+python -m vcot.reporting outputs/ --out reports/
+```
 
 ---
 
@@ -293,8 +365,9 @@ calidad.
 ## 6. Instrumentación de inferencia (nivel researcher)
 
 Objetivo: capturar **toda** la información de inferencia posible, por etapa y
-extremo a extremo. Todo se vuelca a la telemetría de cada muestra (§4.2) y a un
-parquet agregado en un Volume.
+extremo a extremo. Todo se vuelca a la telemetría de cada muestra (§4.2), al
+**ledger de ejecuciones** (`runs.jsonl`) y a un **informe agregado** con fecha
+(Markdown/JSON/CSV vía `vcot.reporting`; export a parquet pendiente).
 
 ### 6.1 Métricas de latencia
 
@@ -335,14 +408,13 @@ Para **cada etapa** y para el pipeline completo:
 > por imagen.
 
 ```text
-app = modal.App("vcot")
+# Dos apps (imágenes y GPU distintas), patrón @app.cls + @enter:
+app = modal.App("vcot-planner")    #  + modal.App("vcot-renderer")
 
-@app.function(gpu=None,           ...)  planner_api        # N1–N6 vía API (sin GPU Modal)
-@app.function(gpu="L4",           ...)  planner_vllm_small # N1–N6 self-hosted ligero
-@app.function(gpu="A100-40GB",    ...)  planner_vllm_big   # N1–N6 self-hosted potente
-@app.function(gpu="H100",         ...)  renderer_flux      # N7 (y renders intermedios)
-@app.function(gpu="L40S",         ...)  critic_vlm         # self-correction
-@app.function(gpu=None, cpu=...,  ...)  aggregator         # telemetría → parquet
+@app.cls(gpu="A100-40GB", ...)  Planner   # N1–N6 · Qwen3-8B en vLLM (coste real)
+@app.cls(gpu="A100-80GB", ...)  Renderer  # N7 · FLUX.2-klein
+# dataset:  Planner().plan.map(prompts)   # fan-out paralelo (§4.4)
+# (pendiente) Critic (self-correction, §5.3)
 ```
 
 ### 7.2 Patrones clave de Modal (impacto directo en coste)
@@ -416,54 +488,72 @@ donde `load_s_amortizado = model_load_s / muestras_por_contenedor` (clave: con
 `compute_s` total facturado por etapa incluye overhead de contenedor; el cómputo
 puro se reporta aparte para análisis.
 
-### 8.3 Estimaciones *a priori* (a sustituir por mediciones reales)
+### 8.3 Mediciones reales (Modal, 2026-06-25 · dataset de 15 trazas)
 
-> Estos números son **placeholders de ingeniería** para dimensionar el
-> presupuesto. El objetivo de la fase Smoke/Pilot es reemplazarlos por medidas
-> reales. Todos suponen contenedores cálidos (`load_s` amortizado ≈ 0).
+> Números **medidos** en Modal con el `cost_timer` sobre un dataset real de
+> **15 trazas** (9 v1 + 6 v2 scene-graph). Planner = **Qwen3-8B** (vLLM,
+> *thinking off*) en A100-40GB. Render = **FLUX.2-klein-9B** (4 pasos, 1024²) en
+> A100-80GB. Contenedor cálido (`load_s` amortizado aparte).
 
-**Renderer N7 — FLUX.1-dev, 1024², 28 pasos:**
+**Planner N1–N6 — media por etapa (15 trazas):**
 
-| GPU | compute_s (est.) | $/imagen | $/1 000 | $/1 000 000 |
-|---|---:|---:|---:|---:|
-| H100 | 6 s | 0.00658 | 6.58 | 6 582 |
-| A100 80GB | 10 s | 0.00694 | 6.94 | 6 940 |
-| L40S | 14 s | 0.00759 | 7.59 | 7 588 |
-| B200 | 3.5 s | 0.00608 | 6.08 | 6 076 |
-
-> Nota: el más caro por segundo (B200) puede ser el **más barato por imagen** si
-> acelera lo suficiente. Esa es exactamente la métrica que el proyecto mide:
-> **coste por unidad de trabajo, no por hora.**
-
-**Planner N1–N6 — self-hosted (Qwen2.5-14B en vLLM, A100-40GB):**
-suponiendo ~1 200 tokens de salida total para las 6 etapas a ~80 tok/s ⇒ ~15 s.
-
-| GPU | compute_s (est.) | $/traza | $/1 000 |
+| Etapa | compute_s | tokens out | $/traza |
 |---|---:|---:|---:|
-| A100 40GB | 15 s | 0.00875 | 8.75 |
-| L40S | 18 s | 0.00976 | 9.76 |
-| L4 | 40 s | 0.00888 | 8.88 |
+| N1 semantic_plan | 5.14 | 108 | 0.00300 |
+| N2 layout | 12.17 | 414 | 0.00709 |
+| N3 composition | 1.29 | 43 | 0.00075 |
+| N4 lighting | 1.21 | 40 | 0.00070 |
+| N5 materials | 2.10 | 70 | 0.00122 |
+| N6 color_script | 2.22 | 76 | 0.00129 |
+| **Total** | **24.1** | **~751** | **0.01406** |
 
-**Planner N1–N6 — API externa (orden de magnitud):** ~1 200 tokens out + ~400 in.
-Coste dependiente del proveedor/modelo; se mide aparte y se compara contra
-self-hosted para decidir la opción más barata a cada escala.
+Coste por traza: media **$0.0141**, rango **$0.0074–$0.0268**. **N2 (layout) es el
+cuello**: ~50% del compute y del coste. El scene-graph (v2) sube el layout de
+$0.0044 (239 tok) a $0.0112 (676 tok) → una traza v2 cuesta ~**60% más** que v1
+($0.0182 vs $0.0113). Es el precio de las relaciones — la señal valiosa.
 
-**Coste por muestra completa (estimación, planner self-hosted + render H100):**
+**Render N7 — FLUX.2-klein, A100-80GB, 4 variaciones por batch:**
+
+| variaciones | compute_s | $/batch | $/imagen |
+|---:|---:|---:|---:|
+| 4 | 9.59 | 0.00665 | **0.00166** |
+
+(1 imagen suelta ≈ 3.2 s / $0.0022; el batch de 4 baja el $/imagen a $0.0017 al
+compartir text-encoding y contenedor.)
+
+**Coste por muestra completa (razonamiento + 4 imágenes):**
 
 ```text
-≈ 0.00875 (planner)  +  0.00658 (render)  ≈ 0.0153 $/muestra
+≈ 0.0141 (N1–N6)  +  0.0067 (4 imgs)  ≈  0.021 $/muestra
 ```
 
-| Escala | Coste estimado (sin renders intermedios) |
-|---|---:|
-| Smoke (100) | ~$1.5 |
-| Pilot (10 000) | ~$153 |
-| Alpha (250 000) | ~$3 825 |
-| Beta (1 000 000) | ~$15 300 |
+| Escala | razonamiento | + 4 imágenes |
+|---|---:|---:|
+| 1 000 | $14 | $21 |
+| 10 000 | $141 | $207 |
+| 250 000 | $3 515 | $5 180 |
+| 1 000 000 | $14 060 | $20 700 |
 
-> Con **renders intermedios** (mecanismo de conditioning fuerte, §3.3) el coste de
-> render se multiplica por ~(1 + nº de pasos intermedios). Esa es una palanca de
-> coste de primer orden que el estudio cuantifica explícitamente.
+> **Hallazgo principal:** el **razonamiento (N1–N6) cuesta ~2× el render de 4
+> imágenes** ($0.0141 vs $0.0067) y dentro del razonamiento **N2 (layout) es ~50%**.
+> En V-CoT el cuello de coste es *pensar*, no *dibujar*. Refuerza la tesis: la
+> inteligencia (y el coste) vive en la cadena de decisiones, no en el píxel final.
+
+**Cold start (facturado; se amortiza con contenedores cálidos / `min_containers`):**
+
+| Modelo | model_load_s | $ (1ª vez) |
+|---|---:|---:|
+| Qwen3-8B (A100-40GB) | 39–76 s | 0.023–0.044 |
+| FLUX.2-klein (A100-80GB) | 148.9 s (incl. descarga ~29 GB) | ~0.103 |
+
+> El `load_s` cae a ≈0 por muestra en lotes grandes (un contenedor cálido sirve
+> muchas trazas). Cuantificar ese punto de equilibrio es el experimento E4.
+> Sigue pendiente E1 (barrido de GPUs) para el óptimo $/calidad: el más caro por
+> segundo (B200) puede ser el **más barato por unidad de trabajo** si acelera lo
+> suficiente — la métrica es coste por trabajo, no por hora.
+
+> Con **renders intermedios** (conditioning fuerte, §3.3) el coste de render se
+> multiplica por ~(1 + nº de pasos intermedios): palanca de coste de primer orden.
 
 ### 8.4 Coste de almacenamiento
 
@@ -482,6 +572,35 @@ cold_start_overhead_$ = (cold_start_s + model_load_s) × rate_gpu
 Ejemplo H100, cold 20 s + load 25 s = 45 s ⇒ **$0.049 por contenedor frío**.
 Decisión a optimizar: ¿pagar `keep_warm` (contenedor ocioso facturado) o pagar
 cold starts repetidos? El estudio traza esa frontera en función del *arrival rate*.
+
+### 8.6 Diversidad: de *schema filling* a *reasoned decomposition*
+
+Medido sobre las 15 trazas, el salto v1 → v2 (scene-graph + prompts anti-plantilla
++ inglés forzado) es nítido:
+
+| Señal | v1 (n=9) | v2 (n=6) |
+|---|---|---|
+| `subject_scale` distintos | **1** (todo 0.6) | **3** (0.25 / 0.3 / 0.4) |
+| `lens` | 35mm casi siempre (8/9) | 24mm / 35mm variado |
+| `rule_of_thirds` = true | 9/9 | 5/6 |
+| trazas en **español** (bug) | 2/9 | **0/6** |
+| relaciones / traza | 0 | **4.2** |
+| entidades / traza | sin tipo | 5.8 (tipadas) |
+| bbox genéricas (área>0.6, no-bg) | — | 27% |
+
+v1 era un **vector casi constante** (la composición no aportaba información: *schema
+filling*). v2 produce decisiones específicas por escena (*reasoned decomposition*),
+con un scene-graph válido (predicados `inside`/`passes_through`/`casts_shadow_on`
+dominantes, efectos tipados como `light`/`atmosphere`/`shadow`).
+
+**Templating residual (pendiente):** `leading_lines` sigue en **15/15 true** y ~27%
+de bboxes aún son genéricas — el razonamiento geométrico fino y algunos booleanos
+todavía caen en defaults. Próximo objetivo de calidad.
+
+> Nota: hoy el layout influye poco en el píxel final porque solo usamos
+> *prompt-enrichment* (§3.1). Su valor real (controlabilidad espacial) se mide en
+> E2 con conditioning fuerte — por eso "el layout aporta poco a la imagen" es cierto
+> bajo el conditioning actual, no una conclusión sobre el scene-graph en sí.
 
 ---
 
@@ -517,49 +636,60 @@ Medir mejora de calidad por iteración de Critic vs coste extra por iteración.
 
 ---
 
-## 10. Estructura del repositorio (propuesta)
+## 10. Estructura del repositorio (implementada)
 
 ```text
 vcot/
+  src/vcot/
+    telemetry/
+      rates.py          # tabla de tarifas (§8.1), única fuente de verdad      [hecho]
+      cost_timer.py     # cronómetro + cálculo de coste por etapa (§7.3)       [hecho]
+    pipeline/
+      schemas.py        # esquemas pydantic de N1–N6 + VCoTTrace (§2.1)        [hecho]
+      prompts.py        # prompts por etapa (chain-of-thought)                 [hecho]
+      llm.py            # LLMClient (local OpenAI-compatible) + fake           [hecho]
+      planner.py        # genera la cadena N1–N6 con coste por etapa           [hecho]
+      visual_tokens.py  # traza ↔ tokens (§2.2)                                [hecho]
+      enrich.py         # traza → prompt de render (§3.1)                      [hecho]
+      pipeline.py       # orquestación N1→N7                                    [hecho]
+    dataset/
+      seed_prompts.py   # prompts semilla (§4.3)                              [hecho]
+      sft.py            # traza → ejemplos de destilación (§5.1)              [hecho]
+    analysis/
+      aggregate.py      # telemetría JSONL → informe de coste/latencia (§8)   [hecho]
+    train/
+      distill.py        # prep del dataset SFT + entrenamiento de Klein (§5)  [hecho]
   modal_app/
-    app.py              # definición de la App y Functions
-    planner.py          # N1–N6 (API + vLLM)
-    renderer.py         # N7 FLUX + conditioning (3 mecanismos)
-    critic.py           # self-correction
-    schemas.py          # esquemas JSON/pydantic de cada etapa
-    visual_tokens.py    # traza ↔ tokens
-  telemetry/
-    cost_timer.py       # cronómetro + cálculo de coste por etapa
-    rates.py            # tabla de tarifas (§8.1), única fuente de verdad
-    aggregate.py        # telemetría → parquet
-  dataset/
-    generate.py         # fan-out .map() para generación masiva
-    record.py           # registro por muestra (§4.2)
-  analysis/
-    cost_report.ipynb   # fronteras de Pareto coste/calidad
-    latency_report.ipynb
-  train/
-    distill_klein.py    # destilación
+    planner.py          # N1–N6 sobre Modal (vLLM) + fan-out .map (§4)         [hecho]
+    renderer.py         # N7 FLUX.2 sobre Modal                                [hecho]
+    pipeline.py         # N1→N7 end-to-end sobre Modal                         [hecho]
   IDEA.md               # este documento
 ```
 
-> El proyecto actual (`src/inferencetest/`) sirve de scaffold; `telemetry/rates.py`
-> debe ser la **única fuente de verdad** de las tarifas para que todo informe de
-> coste sea reproducible y actualizable en un solo sitio.
+> Pendiente sobre este esqueleto: `critic.py` (self-correction, E7), mecanismos de
+> conditioning más fuertes que prompt-enrichment (§3.2–3.3), y export a parquet en
+> `analysis` (hoy CSV/stdlib). `rates.py` es la **única fuente de verdad** de las
+> tarifas: todo informe de coste importa desde ahí.
 
 ---
 
 ## 11. Roadmap
 
-| Hito | Contenido | Criterio de éxito |
-|---|---|---|
-| **M0 — Setup** | App Modal, Volume, Secret, `cost_timer`, `rates.py` | una imagen generada con coste real medido |
-| **M1 — Pipeline V-CoT** | N1–N7 funcionando, registro completo por muestra | 100 muestras (Smoke) con telemetría completa |
-| **M2 — Medición** | E1, E4, E5 | fronteras de Pareto coste/calidad; GPU elegido por etapa |
-| **M3 — Dataset** | Pilot 10k → Alpha 250k vía `.map()` | dataset versionado en Volume + parquet de telemetría |
-| **M4 — Conditioning** | E2, E3 | mecanismo y planner elegidos por coste/calidad |
-| **M5 — Destilación** | E6, E7 (Klein) | Klein ≥ baseline a paridad de parámetros |
-| **M6 — Paper** | redacción, reproducibilidad | dataset + código + informe de costes públicos |
+| Hito | Contenido | Criterio de éxito | Estado |
+|---|---|---|---|
+| **M0 — Setup** | App Modal, Volume, Secret, `cost_timer`, `rates.py` | una imagen generada con coste real medido | ✅ **hecho** (planner + render corridos en Modal, coste real medido) |
+| **M1 — Pipeline V-CoT** | N1–N7 funcionando, registro completo por muestra | 100 muestras (Smoke) con telemetría completa | ✅ etapas N1–N6 y N7 verificadas en GPU; falta correr el lote Smoke completo |
+| **M2 — Medición** | E1, E4, E5 | fronteras de Pareto coste/calidad; GPU elegido por etapa | pendiente (necesita GPUs) |
+| **M3 — Dataset** | Pilot 10k → Alpha 250k vía `.map()` | dataset versionado en Volume + telemetría | fan-out listo; falta correrlo |
+| **M4 — Conditioning** | E2, E3 | mecanismo y planner elegidos por coste/calidad | baseline (enrich) listo; falta E2/E3 |
+| **M5 — Destilación** | E6, E7 (Klein) | Klein ≥ baseline a paridad de parámetros | prep listo; falta el entrenamiento |
+| **M6 — Paper** | redacción, reproducibilidad | dataset + código + informe de costes públicos | pendiente |
+
+> **Estado global:** pipeline N1→N7 + dataset + análisis + prep de destilación
+> implementado y testeado (61 tests). **Verificado en GPUs reales de Modal el
+> 2026-06-25**: planner (Qwen3-8B) y render (FLUX.2-klein) corren y reportan coste
+> real (§8.3). Lo que falta es **escala y experimentos**: generar el dataset
+> completo, correr E1–E7 y entrenar Klein.
 
 ---
 
@@ -576,15 +706,18 @@ vcot/
 
 ---
 
-## 13. Decisiones abiertas (a resolver antes de M1)
+## 13. Decisiones (resueltas en M0/M1)
 
-- **Planner inicial:** ¿API externa (más rápido de validar) o self-hosted (más
-  reproducible)? → recomendación: API en Smoke, self-hosted desde Pilot.
-- **GPU por defecto del renderer:** H100 como punto de partida; confirmar con E1.
-- **Mecanismo de conditioning del MVP:** prompt-enrichment (barato) para M1; subir
-  a conditioning espacial en M4.
-- **Formato de imagen:** WebP (coste de almacenamiento) vs PNG (sin pérdida para
-  métricas). → WebP para finales, PNG para un subconjunto de evaluación.
+- **Planner:** ✅ self-hosted **Qwen3-8B** en vLLM sobre Modal (no API de nube),
+  backend-agnóstico para iterar en local. E3 sigue abierto: comparar tamaños/calidad.
+- **GPU:** ✅ planner A100-40GB, renderer A100-80GB. El barrido para el óptimo
+  $/calidad es E1 (pendiente).
+- **Conditioning del MVP:** ✅ prompt-enrichment (`enrich.py`, §3.1). Subir a
+  conditioning espacial es E2/M4.
+- **Modelo de render:** ✅ FLUX.2-klein-9B (4 pasos) por defecto; FLUX.2-dev (32B)
+  vía `VCOT_MODEL=dev`.
+- **Formato de imagen:** ✅ WebP (q92) para finales. PNG para un subconjunto de
+  evaluación queda pendiente.
 
 ---
 
