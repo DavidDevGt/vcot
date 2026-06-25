@@ -42,7 +42,8 @@ class RunRecord:
     model: Optional[str] = None
     gpu: Optional[str] = None
     n_items: int = 0
-    total_cost_usd: float = 0.0
+    total_cost_usd: float = 0.0  # coste MARGINAL (solo inferencia, vía cost_timer)
+    real_cost_est_usd: float = 0.0  # coste REAL estimado (carga + idle tail + CPU/mem)
     status: str = "ok"
     error: Optional[str] = None
     params: Dict[str, object] = field(default_factory=dict)

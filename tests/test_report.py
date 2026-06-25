@@ -1,6 +1,8 @@
 import json
 import os
 
+import pytest
+
 from vcot.reporting.report import build_report, render_markdown, write_bundle
 
 
@@ -58,9 +60,26 @@ def test_render_markdown_sections(trace):
         "## 1. Resumen ejecutivo",
         "## 2. Coste y latencia por etapa",
         "## 3. Render (N7)",
-        "## 6. Registro de ejecuciones",
+        "## 6. Coste real facturado por Modal",
+        "## 7. Registro de ejecuciones",
     ]:
         assert header in md, header
+
+
+def test_build_report_with_container_costs(trace):
+    runs = [{"kind": "renderer", "total_cost_usd": 0.01, "real_cost_est_usd": 0.13, "n_items": 1}]
+    container_costs = [
+        {"kind": "renderer", "real_cost_usd": 0.132, "gpu_cost_usd": 0.119,
+         "cpu_cost_usd": 0.0003, "mem_cost_usd": 0.012, "billed_s": 172.0},
+    ]
+    rep = build_report(_records(trace), runs, container_costs)
+    rb = rep["real_billed"]
+    assert rb["n_containers"] == 1
+    assert rb["total_real_cost_usd"] == pytest.approx(0.132)
+    assert rb["real_to_marginal_ratio"] is not None  # real >> marginal
+    assert rep["ledger"]["total_real_cost_est_usd"] == pytest.approx(0.13)
+    md = render_markdown(rep)
+    assert "Coste REAL facturado por Modal" in md
 
 
 def test_write_bundle_creates_files(trace, tmp_path):

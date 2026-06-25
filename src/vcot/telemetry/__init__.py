@@ -7,6 +7,11 @@ tarifas.
 
 from __future__ import annotations
 
+from vcot.telemetry.billing import (
+    ContainerCost,
+    ContainerMeter,
+    projected_container_cost,
+)
 from vcot.telemetry.cost_timer import CostTimer, cost_timer
 from vcot.telemetry.rates import (
     CPU_PER_SECOND,
@@ -21,6 +26,9 @@ from vcot.telemetry.rates import (
 __all__ = [
     "CostTimer",
     "cost_timer",
+    "ContainerCost",
+    "ContainerMeter",
+    "projected_container_cost",
     "gpu_rate",
     "resource_rate",
     "GPU_PER_SECOND",

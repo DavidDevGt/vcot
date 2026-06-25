@@ -59,6 +59,10 @@ GPU = os.environ.get("VCOT_PLANNER_GPU", CFG["gpu"])  # debe ser una clave de ra
 CACHE_DIR = "/cache"
 OUTPUT_DIR = "/outputs"
 
+#: Segundos que Modal mantiene vivo (y factura) el contenedor tras la última
+#: llamada — coste de GPU puro que el `cost_timer` marginal no ve.
+SCALEDOWN_WINDOW = 120
+
 # --------------------------------------------------------------------------- #
 # Imagen del contenedor
 # --------------------------------------------------------------------------- #
@@ -144,12 +148,17 @@ class _VLLMClient:
     volumes={CACHE_DIR: hf_cache, OUTPUT_DIR: outputs},
     secrets=[hf_secret],
     timeout=60 * 60,
-    scaledown_window=120,  # mantener el contenedor ~2 min tras la última llamada
+    scaledown_window=SCALEDOWN_WINDOW,  # mantener el contenedor ~2 min tras la última llamada
 )
 class Planner:
     @modal.enter()
     def load(self):
         """Carga el motor vLLM una vez por contenedor (amortiza model_load_s)."""
+        from vcot.telemetry import ContainerMeter
+
+        # Medidor de coste real: arranca antes de cargar vLLM (la carga se factura).
+        self.meter = ContainerMeter(GPU)
+
         from vllm import LLM, SamplingParams
 
         t0 = time.perf_counter()
@@ -170,6 +179,31 @@ class Planner:
         self.sampling = SamplingParams(**self._sampling_kwargs)
         self.model_load_s = time.perf_counter() - t0
         print(f"[load] {CFG['repo']} en {GPU} en {self.model_load_s:.1f}s")
+
+    @modal.exit()
+    def _bill(self):
+        """Coste REAL del contenedor: vida completa (carga + plans + idle tail)."""
+        meter = getattr(self, "meter", None)
+        if meter is None:  # load() falló antes de crear el medidor
+            return
+        cost = meter.stop()
+        record = {
+            "kind": "planner",
+            "model": MODEL,
+            "model_load_s": round(getattr(self, "model_load_s", 0.0), 3),
+            **cost.as_dict(),
+        }
+        try:
+            with open(f"{OUTPUT_DIR}/container_costs.jsonl", "a", encoding="utf-8") as fh:
+                fh.write(json.dumps(record, ensure_ascii=False) + "\n")
+            outputs.commit()
+        except Exception as exc:  # noqa: BLE001
+            print(f"[cost] no se pudo persistir container_costs.jsonl: {exc}")
+        print(
+            f"[cost] contenedor REAL ${cost.real_cost_usd:.5f} · {cost.billed_s:.1f}s vida "
+            f"(GPU ${cost.gpu_cost_usd:.5f} + CPU ${cost.cpu_cost_usd:.5f} + "
+            f"mem ${cost.mem_cost_usd:.5f}, {cost.mem_gib:.1f} GiB pico)"
+        )
 
     @modal.method()
     def plan(self, prompt: str, seed: int | None = None) -> dict:
@@ -227,12 +261,21 @@ def main(
 ):
     """Genera una traza en Modal y la guarda en local junto a su telemetría."""
     from vcot.reporting.runlog import track_run
+    from vcot.telemetry import projected_container_cost
 
     os.makedirs(out, exist_ok=True)
     with track_run(os.path.join(out, "runs.jsonl"), kind="planner", model=CFG["repo"], gpu=GPU) as run:
         record = Planner().plan.remote(prompt, seed=None if seed < 0 else seed)
+        active_s = sum(t["compute_s"] for t in record["telemetry"].values())
+        proj = projected_container_cost(
+            gpu=GPU,
+            active_s=active_s,
+            model_load_s=record["meta"].get("model_load_s", 0.0),
+            scaledown_window=SCALEDOWN_WINDOW,
+        )
         run["n_items"] = 1
         run["total_cost_usd"] = sum(t["projected_cost_usd"] for t in record["telemetry"].values())
+        run["real_cost_est_usd"] = proj.real_cost_usd
 
     path = os.path.join(out, f"{record['id']}.trace.json")
     with open(path, "w", encoding="utf-8") as fh:
@@ -243,12 +286,21 @@ def main(
 
     print("\nVisual tokens:\n  " + " ".join(record["visual_tokens"]))
     print(f"\nTraza -> {path}")
-    print("Telemetría (coste real de Modal):")
+    print("Telemetría — coste marginal por etapa (solo inferencia):")
+    marginal = 0.0
     for stage, tele in record["telemetry"].items():
+        marginal += tele["projected_cost_usd"]
         print(
             f"  {stage:<14} {tele['compute_s']:6.2f}s  "
             f"{tele['output_tokens']:5d} tok  ${tele['projected_cost_usd']:.6f}"
         )
+    print(
+        f"\nCoste marginal (inferencia):  ${marginal:.6f}\n"
+        f"Coste REAL estimado (carga + plan + idle {SCALEDOWN_WINDOW}s): "
+        f"${proj.real_cost_usd:.6f}"
+        + (f"  ({proj.real_cost_usd / marginal:.1f}× el marginal)" if marginal else "")
+        + "\n  → cifra exacta en outputs/container_costs.jsonl (la mide @modal.exit)"
+    )
 
 
 @app.local_entrypoint()
@@ -262,16 +314,20 @@ def generate(prompts_file: str = "", limit: int = 0, out: str = "outputs"):
         modal run modal_app/planner.py::generate --limit 5
         modal run modal_app/planner.py::generate --prompts-file prompts.txt
     """
-    from vcot.dataset import SEED_PROMPTS
+    from vcot.dataset import SEED_PROMPTS, generate_prompts
     from vcot.reporting.runlog import track_run
 
     if prompts_file:
         with open(prompts_file, encoding="utf-8") as fh:
             prompts = [ln.strip() for ln in fh if ln.strip()]
+        if limit:
+            prompts = prompts[:limit]
+    elif limit:
+        # Expansión estratificada determinista (núcleo curado + generados) para
+        # llegar a `limit` aunque supere los prompts curados (p.ej. Smoke 100).
+        prompts = generate_prompts(limit)
     else:
         prompts = list(SEED_PROMPTS)
-    if limit:
-        prompts = prompts[:limit]
 
     os.makedirs(out, exist_ok=True)
     traces_path = os.path.join(out, "traces.jsonl")
@@ -320,7 +376,11 @@ def generate(prompts_file: str = "", limit: int = 0, out: str = "outputs"):
 
     avg = total_cost / n if n else 0.0
     print(
-        f"\n{n} trazas generadas · coste razonamiento ≈ ${total_cost:.4f} "
+        f"\n{n} trazas generadas · coste MARGINAL razonamiento ≈ ${total_cost:.4f} "
         f"(${avg:.6f}/traza) · dataset en {traces_path} (+ Volume vcot-outputs)"
+    )
+    print(
+        "Coste REAL (carga + idle de cada contenedor del fan-out): se mide por "
+        "contenedor en el Volume → outputs/container_costs.jsonl. Súmalo para el gasto real."
     )
     print(f"Informe final:  python -m vcot.reporting {out}")

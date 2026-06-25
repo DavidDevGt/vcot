@@ -19,6 +19,7 @@ Uso:
 
 from __future__ import annotations
 
+import hashlib
 import io
 import json
 import os
@@ -60,6 +61,11 @@ GPU = os.environ.get("VCOT_GPU", CFG["gpu"])  # debe coincidir con una clave de 
 
 CACHE_DIR = "/cache"
 OUTPUT_DIR = "/outputs"
+
+#: Segundos que Modal mantiene vivo (y factura) el contenedor tras la última
+#: llamada. Es coste de GPU puro que el `cost_timer` marginal nunca ve; el
+#: `ContainerMeter` y la proyección de coste real sí lo cuentan.
+SCALEDOWN_WINDOW = 120
 
 #: Negativo sugerido (artefactos comunes). Vacío por defecto: el negativo es
 #: opt-in porque en FLUX requiere CFG real (~2× coste). Pasalo con --negative.
@@ -113,12 +119,18 @@ hf_secret = modal.Secret.from_name("huggingface-secret")
     volumes={CACHE_DIR: hf_cache, OUTPUT_DIR: outputs},
     secrets=[hf_secret],
     timeout=60 * 60,
-    scaledown_window=120,  # mantener el contenedor ~2 min tras la última llamada
+    scaledown_window=SCALEDOWN_WINDOW,  # mantener el contenedor ~2 min tras la última llamada
 )
 class Renderer:
     @modal.enter()
     def load(self):
         """Carga los pesos una vez por contenedor (amortiza model_load_s)."""
+        from vcot.telemetry import ContainerMeter
+
+        # Arranca el medidor de coste real ANTES de cargar pesos: la carga también
+        # se factura. Mide toda la vida del contenedor (carga + render + idle tail).
+        self.meter = ContainerMeter(GPU)
+
         import torch
         import diffusers
 
@@ -136,6 +148,36 @@ class Renderer:
         self.model_load_s = time.perf_counter() - t0
         print(f"[load] {CFG['repo']} en {GPU} en {self.model_load_s:.1f}s")
 
+    @modal.exit()
+    def _bill(self):
+        """Coste REAL del contenedor: vida completa (carga + renders + idle tail).
+
+        Modal factura toda esta ventana — no solo el `cost_timer` de cada render —
+        más CPU y memoria (medidos del cgroup). Se registra en el Volume para que
+        el informe sume el gasto real, no el marginal.
+        """
+        meter = getattr(self, "meter", None)
+        if meter is None:  # load() falló antes de crear el medidor
+            return
+        cost = meter.stop()
+        record = {
+            "kind": "renderer",
+            "model": MODEL,
+            "model_load_s": round(getattr(self, "model_load_s", 0.0), 3),
+            **cost.as_dict(),
+        }
+        try:
+            with open(f"{OUTPUT_DIR}/container_costs.jsonl", "a") as fh:
+                fh.write(json.dumps(record) + "\n")
+            outputs.commit()
+        except Exception as exc:  # noqa: BLE001 - el coste igual se imprime
+            print(f"[cost] no se pudo persistir container_costs.jsonl: {exc}")
+        print(
+            f"[cost] contenedor REAL ${cost.real_cost_usd:.5f} · {cost.billed_s:.1f}s vida "
+            f"(GPU ${cost.gpu_cost_usd:.5f} + CPU ${cost.cpu_cost_usd:.5f} + "
+            f"mem ${cost.mem_cost_usd:.5f}, {cost.mem_gib:.1f} GiB pico)"
+        )
+
     @modal.method()
     def render(
         self,
@@ -148,8 +190,13 @@ class Renderer:
         width: int = 1024,
         n_variations: int = 4,
         true_cfg_scale: float = 1.0,
+        sample_id: str | None = None,
     ) -> dict:
         """Genera **N variaciones** del mismo prompt; telemetría + bytes WebP (§4.2, §6).
+
+        ``sample_id`` liga las imágenes a una traza (las nombra ``{sample_id}_i``);
+        si es ``None`` se genera un uuid (uso suelto del renderer). El record
+        incluye ``images`` con el ``sha256`` de cada variación (linkage/integridad).
 
         Las variaciones se generan en un solo batch (`num_images_per_prompt`):
         comparten el text-encoding y el contenedor cálido, así que salen mucho más
@@ -204,8 +251,20 @@ class Renderer:
             image_bytes_list.append(buf.getvalue())
         n = len(image_bytes_list)
 
-        sample_id = uuid.uuid4().hex
+        sample_id = sample_id or uuid.uuid4().hex  # = trace.id si lo pasa el pipeline
         final_images = [f"{OUTPUT_DIR}/{sample_id}_{i}.webp" for i in range(n)]
+        # Linkage estable: cada variación con su hash de contenido (dedup/integridad).
+        images = [
+            {
+                "path": path,
+                "sha256": hashlib.sha256(image_bytes).hexdigest(),
+                "idx": i,
+                "width": width,
+                "height": height,
+                "seed": seed,
+            }
+            for i, (path, image_bytes) in enumerate(zip(final_images, image_bytes_list))
+        ]
         render_tel = t.as_dict()  # {compute_s, rate_usd_per_s, cost_usd}
         render_tel["n_variations"] = n
         render_tel["cost_per_image_usd"] = round(t.cost / n, 8) if n else 0.0
@@ -232,6 +291,7 @@ class Renderer:
             },
             "final_image": final_images[0],  # variación principal
             "final_images": final_images,
+            "images": images,  # linkage estable traza↔imagen (sha256 por variación)
         }
 
         # Persistir las N variaciones + registro JSONL en el Volume.
@@ -274,6 +334,7 @@ def main(
     default` para el negativo sugerido). `--cfg` fija true_cfg_scale (0 = auto).
     """
     from vcot.reporting.runlog import track_run
+    from vcot.telemetry import projected_container_cost
 
     if negative.strip().lower() == "default":
         negative = DEFAULT_NEGATIVE
@@ -288,8 +349,17 @@ def main(
             n_variations=variations,
             true_cfg_scale=cfg if cfg > 0 else 1.0,
         )
+        render_tel = record["telemetry"]["render"]
+        # Coste marginal (solo inferencia) vs. coste real estimado (carga + idle tail).
+        proj = projected_container_cost(
+            gpu=GPU,
+            active_s=render_tel["compute_s"],
+            model_load_s=record["telemetry"]["model_load_s"],
+            scaledown_window=SCALEDOWN_WINDOW,
+        )
         run["n_items"] = record["meta"]["n_variations"]
-        run["total_cost_usd"] = record["telemetry"]["render"]["cost_usd"]
+        run["total_cost_usd"] = render_tel["cost_usd"]
+        run["real_cost_est_usd"] = proj.real_cost_usd
     image_bytes_list = record.pop("_image_bytes_list")
 
     paths = []
@@ -304,3 +374,11 @@ def main(
         print("  " + p)
     print("Telemetría:")
     print(json.dumps(record["telemetry"], indent=2, ensure_ascii=False))
+    marginal = render_tel["cost_usd"]
+    ratio = f"  ({proj.real_cost_usd / marginal:.1f}× el marginal)" if marginal else ""
+    print(
+        f"\nCoste marginal (inferencia):  ${marginal:.5f}\n"
+        f"Coste REAL estimado (carga {record['telemetry']['model_load_s']:.0f}s + "
+        f"render + idle {SCALEDOWN_WINDOW}s): ${proj.real_cost_usd:.5f}{ratio}\n"
+        f"  → cifra exacta en outputs/container_costs.jsonl (la mide @modal.exit)"
+    )
