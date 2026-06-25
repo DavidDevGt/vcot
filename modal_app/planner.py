@@ -292,16 +292,27 @@ def generate(prompts_file: str = "", limit: int = 0, out: str = "outputs"):
             for index, item in enumerate(
                 Planner().plan.map(prompts, return_exceptions=True), start=1
             ):
-                if isinstance(item, ExceptionWrapper):
+                if isinstance(item, ExceptionWrapper) or isinstance(item, BaseException):
                     prompt = prompts[index - 1] if index <= len(prompts) else "<unknown>"
+                    error_obj = item.value if isinstance(item, ExceptionWrapper) else item
                     print(
                         f"WARNING: prompt #{index} failed while planning: {prompt!r}\n"
-                        f"  error: {item.value}",
+                        f"  error: {type(error_obj).__name__}: {error_obj}",
                         file=sys.stderr,
                     )
                     continue
+
                 rec = item
-                fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
+                try:
+                    fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
+                except TypeError:
+                    prompt = prompts[index - 1] if index <= len(prompts) else "<unknown>"
+                    print(
+                        f"WARNING: prompt #{index} produced a non-serializable result: {prompt!r}\n"
+                        f"  result type: {type(rec).__name__} repr: {repr(rec)}",
+                        file=sys.stderr,
+                    )
+                    continue
                 n += 1
                 total_cost += sum(t["projected_cost_usd"] for t in rec["telemetry"].values())
         run["n_items"] = n
