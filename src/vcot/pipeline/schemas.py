@@ -292,6 +292,39 @@ class StageTelemetry(BaseModel):
     last_error: Optional[str] = None  # por qué falló el 1er intento (diagnóstico)
 
 
+class ImageRef(BaseModel):
+    """Una imagen renderizada **ligada a su traza** (linkage estable, §4.2).
+
+    Resuelve el bug histórico de trazabilidad: hasta ahora las imágenes llevaban
+    un uuid propio del renderer, distinto del ``trace.id``. Aquí cada variación
+    referencia su path, su hash de contenido (``sha256``, dedup/integridad), la
+    semilla del batch (reproducibilidad) y su índice de variación.
+    """
+
+    path: str = Field(..., min_length=1)
+    sha256: str = Field(..., min_length=1)
+    idx: int = Field(..., ge=0)  # índice de variación (0..n-1)
+    width: int = Field(..., gt=0)
+    height: int = Field(..., gt=0)
+    seed: Optional[int] = None  # semilla del batch (None = aleatoria)
+
+
+class DatasetMeta(BaseModel):
+    """Provenance / curación de una muestra del dataset (datacard, §4.2).
+
+    Campos rellenados a lo largo del pipeline: ``license``/``code_version`` al
+    generar; ``safety``/``quality`` por la capa de eval; ``split`` al particionar.
+    Todo opcional para no romper trazas previas (solo razonamiento).
+    """
+
+    license: Optional[str] = None  # licencia efectiva (modelo de render + planner)
+    code_version: Optional[str] = None  # git sha del código que generó la muestra
+    stratum: Optional[str] = None  # género del prompt (breakdown por estrato)
+    split: Optional[Literal["train", "val", "test"]] = None
+    safety: Dict[str, object] = Field(default_factory=dict)  # NSFW/filtros (Fase 3)
+    quality: Dict[str, object] = Field(default_factory=dict)  # clip/aesthetic/faithfulness
+
+
 class VCoTTrace(BaseModel):
     """La traza completa de pensamiento visual de un prompt (IDEA.md §4.2).
 
@@ -316,8 +349,10 @@ class VCoTTrace(BaseModel):
     enriched_prompt: Optional[str] = None
     final_image: Optional[str] = None
     final_images: List[str] = Field(default_factory=list)
+    images: List[ImageRef] = Field(default_factory=list)  # linkage estable traza↔imagen
     render: Optional[StageTelemetry] = None
 
+    dataset: Optional[DatasetMeta] = None  # provenance/curación (datacard)
     telemetry: Dict[str, StageTelemetry] = Field(default_factory=dict)
     meta: Dict[str, object] = Field(default_factory=dict)
 

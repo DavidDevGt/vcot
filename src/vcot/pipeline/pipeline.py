@@ -14,7 +14,7 @@ from __future__ import annotations
 from typing import Callable, Protocol
 
 from vcot.pipeline.enrich import enrich_prompt
-from vcot.pipeline.schemas import StageTelemetry, VCoTTrace
+from vcot.pipeline.schemas import ImageRef, StageTelemetry, VCoTTrace
 
 
 class SupportsPlan(Protocol):
@@ -22,10 +22,11 @@ class SupportsPlan(Protocol):
         ...
 
 
-#: ``render_fn(enriched_prompt) -> render record`` con la forma que produce
-#: ``modal_app/renderer.py``: ``{"final_image", "telemetry": {"render": {...}},
-#: "meta": {"gpu": ...}}``.
-RenderFn = Callable[[str], dict]
+#: ``render_fn(enriched_prompt, sample_id) -> render record`` con la forma que
+#: produce ``modal_app/renderer.py``: ``{"final_image", "images": [...],
+#: "telemetry": {"render": {...}}, "meta": {"gpu": ...}}``. Se le pasa el
+#: ``sample_id`` (= ``trace.id``) para que las imágenes queden ligadas a la traza.
+RenderFn = Callable[[str, str], dict]
 
 
 def _coerce_render_telemetry(record: dict) -> StageTelemetry:
@@ -51,10 +52,11 @@ def run_pipeline(
     trace = planner.plan(prompt)
     trace.enriched_prompt = enrich(trace)
 
-    record = render_fn(trace.enriched_prompt)
+    record = render_fn(trace.enriched_prompt, trace.id)
     trace.final_image = record.get("final_image")
     trace.final_images = record.get("final_images") or (
         [trace.final_image] if trace.final_image else []
     )
+    trace.images = [ImageRef.model_validate(im) for im in record.get("images", [])]
     trace.render = _coerce_render_telemetry(record)
     return trace

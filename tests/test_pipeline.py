@@ -5,12 +5,18 @@ from vcot.pipeline.pipeline import run_pipeline
 from vcot.pipeline.planner import Planner
 
 
-def _fake_render(enriched: str) -> dict:
-    # Imita el registro que devuelve modal_app/renderer.py (4 variaciones)
-    imgs = [f"/outputs/abc_{i}.webp" for i in range(4)]
+def _fake_render(enriched: str, sample_id: str) -> dict:
+    # Imita el registro que devuelve modal_app/renderer.py (4 variaciones).
+    # Las imágenes se nombran con el sample_id (= trace.id) → linkage estable.
+    imgs = [f"/outputs/{sample_id}_{i}.webp" for i in range(4)]
     return {
         "final_image": imgs[0],
         "final_images": imgs,
+        "images": [
+            {"path": imgs[i], "sha256": f"hash{i}", "idx": i,
+             "width": 1024, "height": 1024, "seed": None}
+            for i in range(4)
+        ],
         "telemetry": {
             "render": {
                 "compute_s": 2.0, "rate_usd_per_s": 0.000694, "cost_usd": 0.001388,
@@ -26,8 +32,11 @@ def test_run_pipeline_closes_the_loop(valid_responses):
     trace = run_pipeline("a lone astronaut", planner, _fake_render)
 
     assert trace.enriched_prompt and "astronaut" in trace.enriched_prompt
-    assert trace.final_image == "/outputs/abc_0.webp"
-    assert trace.final_images == [f"/outputs/abc_{i}.webp" for i in range(4)]
+    # Linkage estable: las imágenes se nombran con el trace.id, no un uuid suelto.
+    assert trace.final_image == f"/outputs/{trace.id}_0.webp"
+    assert trace.final_images == [f"/outputs/{trace.id}_{i}.webp" for i in range(4)]
+    assert [im.path for im in trace.images] == trace.final_images
+    assert [im.sha256 for im in trace.images] == [f"hash{i}" for i in range(4)]
     assert trace.render is not None
     assert trace.render.projected_gpu == "A100-80GB"
     assert trace.render.projected_cost_usd == pytest.approx(0.001388)

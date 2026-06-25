@@ -59,8 +59,11 @@ def main(
     renderer = _Renderer()
     image_holder: dict = {}
 
-    def render_fn(enriched: str) -> dict:
-        record = renderer.render.remote(enriched, negative_prompt=negative)  # 4 variaciones
+    def render_fn(enriched: str, sample_id: str) -> dict:
+        # sample_id = trace.id ⇒ imágenes ligadas a la traza ({trace.id}_i.webp).
+        record = renderer.render.remote(
+            enriched, negative_prompt=negative, sample_id=sample_id
+        )  # 4 variaciones
         image_holder["bytes_list"] = record.pop("_image_bytes_list", [])
         return record
 

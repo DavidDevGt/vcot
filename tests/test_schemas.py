@@ -4,7 +4,9 @@ from pydantic import ValidationError
 from vcot.pipeline.schemas import (
     ColorScript,
     Composition,
+    DatasetMeta,
     Entity,
+    ImageRef,
     Lighting,
     Materials,
     Relation,
@@ -153,6 +155,37 @@ def test_trace_rejects_unknown_telemetry_stage():
     }
     with pytest.raises(ValidationError):
         _minimal_trace(telemetry=bad)
+
+
+def test_image_ref_validates_fields():
+    ref = ImageRef(path="/outputs/abc_0.webp", sha256="deadbeef", idx=0, width=1024, height=1024)
+    assert ref.idx == 0 and ref.seed is None
+    with pytest.raises(ValidationError):
+        ImageRef(path="x", sha256="h", idx=-1, width=1024, height=1024)  # idx < 0
+    with pytest.raises(ValidationError):
+        ImageRef(path="x", sha256="h", idx=0, width=0, height=1024)  # width <= 0
+
+
+def test_dataset_meta_split_literal():
+    meta = DatasetMeta(license="L", code_version="abc123", split="train")
+    assert meta.split == "train"
+    with pytest.raises(ValidationError):
+        DatasetMeta(split="holdout")  # no es train/val/test
+
+
+def test_trace_links_images_and_dataset_meta():
+    images = [ImageRef(path=f"/o/abc_{i}.webp", sha256=f"h{i}", idx=i, width=512, height=512)
+              for i in range(4)]
+    trace = _minimal_trace(images=images, dataset=DatasetMeta(license="L", code_version="abc"))
+    assert [im.idx for im in trace.images] == [0, 1, 2, 3]
+    assert trace.dataset.code_version == "abc"
+
+
+def test_trace_backward_compatible_without_images():
+    # Trazas previas (solo razonamiento N1–N6) siguen validando: images/dataset opcionales.
+    trace = _minimal_trace()
+    assert trace.images == []
+    assert trace.dataset is None
 
 
 def test_trace_totals():
